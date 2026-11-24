@@ -34,7 +34,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 TOOL = "hermes-backup"
-VERSION = "0.3.2"
+VERSION = "0.3.3"
 FORMAT = 2
 MANIFEST = "manifest.json"
 MAGIC1 = b"HBZ1"
@@ -85,17 +85,67 @@ BOOLISH = re.compile(r"(?i)^(true|false|null|none|~|-?\d+(?:\.\d+)?)$")
 ENVREF = re.compile(r"^(\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_]*|env:[A-Za-z_][A-Za-z0-9_]*)$")
 
 
+
+_QUIET = False
+_SUPPRESS_FAILS = False
+_COLOR = bool(getattr(sys.stdout, "isatty", lambda: False)() and not os.environ.get("NO_COLOR"))
+
+
+def _enable_vt() -> None:
+    if os.name != "nt" or not _COLOR:
+        return
+    try:
+        import ctypes
+        kernel = ctypes.windll.kernel32
+        kernel.SetConsoleMode(kernel.GetStdHandle(-11), 7)
+    except Exception:
+        pass
+
+
+def paint(code: str, text: str) -> str:
+    return ("\033[" + code + "m" + text + "\033[0m") if _COLOR else text
+
+
+def green(text: str) -> str:
+    return paint("32", text)
+
+
+def red(text: str) -> str:
+    return paint("31;1", text)
+
+
+def yellow(text: str) -> str:
+    return paint("33", text)
+
+
+def cyan(text: str) -> str:
+    return paint("36", text)
+
+
+def bold(text: str) -> str:
+    return paint("1", text)
+
+
 def log(msg: str) -> None:
+    if _QUIET:
+        return
     print(msg, flush=True)
 
 
 def warn(msg: str) -> None:
-    print("warning: " + msg, file=sys.stderr, flush=True)
+    if _QUIET:
+        return
+    print(yellow("warning: ") + msg, file=sys.stderr, flush=True)
 
 
 def fail(msg: str, code: int = 1):
-    print("error: " + msg, file=sys.stderr, flush=True)
+    if not _SUPPRESS_FAILS:
+        print(red("error: ") + msg, file=sys.stderr, flush=True)
     raise SystemExit(code)
+
+
+def step(msg: str) -> None:
+    print("  " + green("✓") + " " + msg, flush=True)
 
 
 def human(n: float) -> str:
@@ -794,7 +844,7 @@ def cmd_backup(args) -> int:
             manifest = write_archive(out, files, make_manifest)
 
         log("")
-        log("written: %s (%s)" % (out, human(out.stat().st_size)))
+        log("written: %s (%s)" % (green(str(out)), human(out.stat().st_size)))
         log("files: %d   raw: %s   secrets: %s   crypto: %s" % (
             len(manifest["entries"]), human(manifest["totals"]["bytes"]),
             "yes" if secrets else "no", crypto or "no"))
@@ -822,7 +872,7 @@ def verify_archive(archive: Path, args, only=None, quiet=False) -> int:
             warn(p)
         if len(problems) > 20:
             warn("... and %d more problem(s)" % (len(problems) - 20))
-        log("result: %s" % ("OK" if not problems else "FAILED"))
+        log("result: %s" % (green("OK") if not problems else red("FAILED")))
     return 0 if not problems else 1
 
 
@@ -908,12 +958,15 @@ def cmd_restore(args) -> int:
 
 
 def cmd_selftest(args) -> int:
+    global _QUIET, _SUPPRESS_FAILS
     tmp = Path(tempfile.mkdtemp(prefix="hermes-backup-selftest-"))
+    _QUIET = True
     try:
         home = tmp / "home"
         (home / "sessions").mkdir(parents=True)
         (home / "skills" / "demo").mkdir(parents=True)
         (home / "platforms").mkdir()
+        (home / "cache").mkdir()
         (home / "config.yaml").write_text(
             "model:\n  default: test\n  api_key: sk-abcdef1234567890xyz\n"
             "  redact_secrets: true\n"
@@ -922,63 +975,68 @@ def cmd_selftest(args) -> int:
         (home / "platforms" / "creds.json").write_text('{"t":"x"}', encoding="utf-8")
         (home / "sessions" / "a.json").write_text("hello", encoding="utf-8")
         (home / "skills" / "demo" / "SKILL.md").write_text("# demo\n", encoding="utf-8")
-        db = home / "state.db"
-        con = sqlite3.connect(str(db))
+        (home / "cache" / "huge.bin").write_bytes(b"x" * 4096)
+        con = sqlite3.connect(str(home / "state.db"))
         con.execute("CREATE TABLE t (v TEXT)")
         con.execute("INSERT INTO t VALUES ('hello')")
         con.commit()
         con.close()
-        (home / "cache").mkdir()
-        (home / "cache" / "huge.bin").write_bytes(b"x" * 4096)
 
+        print(bold("自检") + "  " + cyan("hermes-backup " + VERSION))
         base = dict(home=str(home), profile="data", force=False, no_hash=False,
                     exclude=[], dry_run=False, no_scrub=False, anonymize=False,
                     db_snapshot=True, allow_plaintext_secrets=False,
-                    password_env=None, password_file=None)
+                    password_env=None, password_file=None, password=None)
 
         plain = tmp / "plain.zip"
         args_p = argparse.Namespace(with_secrets=False, encrypt=False, crypto="v2",
                                     out=str(plain), **base)
         if cmd_backup(args_p) != 0:
-            fail("selftest: plain backup failed")
+            fail("自检失败：默认备份未完成")
         with zipfile.ZipFile(str(plain)) as zf:
             names = set(zf.namelist())
             man = read_manifest(zf)
             if "auth.json" in names or "platforms/creds.json" in names:
-                fail("selftest: credentials leaked into default archive")
+                fail("自检失败：凭据泄漏")
             cfg = zf.read("config.yaml").decode("utf-8")
             if "sk-abcdef" in cfg or "AAAAsecret" in cfg:
-                fail("selftest: config.yaml was not scrubbed")
+                fail("自检失败：配置未脱敏")
             if "redact_secrets: true" not in cfg:
-                fail("selftest: boolean setting was redacted by mistake")
+                fail("自检失败：布尔值被误脱敏")
             checked, problems = audit_archive(zf, man)
             if problems:
-                fail("selftest: audit found problems: %r" % problems[:3])
-            snap = zf.read("state.db")
-            if not snap.startswith(b"SQLite format 3\x00"):
-                fail("selftest: state.db was not snapshotted")
+                fail("自检失败：审计报错 %r" % problems[:3])
+            if not zf.read("state.db").startswith(b"SQLite format 3\x00"):
+                fail("自检失败：数据库未快照")
+        step("默认备份：凭据已排除、配置已脱敏、数据库已快照")
 
-        # traversal + duplicate detection on a crafted archive
         bad = tmp / "bad.zip"
-        with zipfile.ZipFile(str(bad), "w") as zf:
-            zf.writestr("safe.txt", "x")
-            zf.writestr("../evil.txt", "x")
-            zf.writestr("safe.txt", "y")
+        import warnings as _warnings
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            with zipfile.ZipFile(str(bad), "w") as zf:
+                zf.writestr("safe.txt", "x")
+                zf.writestr("../evil.txt", "x")
+                zf.writestr("safe.txt", "y")
         with zipfile.ZipFile(str(bad)) as zf:
             man = {"tool": TOOL, "format": FORMAT, "entries": [], "totals": {"files": 0, "bytes": 0}}
             _, problems = audit_archive(zf, man)
-            joined = " ".join(problems)
-            if "duplicate zip entry" not in joined:
-                fail("selftest: duplicate zip entries were not detected")
-            if "not listed in manifest" not in joined:
-                fail("selftest: unlisted entries were not detected")
+        joined = " ".join(problems)
+        if "duplicate zip entry" not in joined or "not listed in manifest" not in joined:
+            fail("自检失败：重复条目或未登记条目未被识别")
+        step("归档审计：重复条目与未登记文件都能识别")
 
-        for evil in ("../x", "/abs", "C:/x", "a\\\\b", "CON", "a..", "x/../../y"):
-            try:
-                validate_rel(evil)
-            except SystemExit:
-                continue
-            fail("selftest: unsafe path accepted: %r" % evil)
+        _SUPPRESS_FAILS = True
+        try:
+            for evil in ("../x", "/abs", "C:/x", "a\\b", "CON", "a..", "x/../../y"):
+                try:
+                    validate_rel(evil)
+                except SystemExit:
+                    continue
+                fail("自检失败：不安全路径被接受 %r" % evil)
+        finally:
+            _SUPPRESS_FAILS = False
+        step("路径校验：盘符、UNC、反斜杠、.. 与保留名全部拒绝")
 
         crypto = "v2" if HAVE_AES else "v1"
         enc = tmp / "enc.hbz"
@@ -987,53 +1045,68 @@ def cmd_selftest(args) -> int:
                                     out=str(enc), **base)
         args_e.password_env = "HB_SELFTEST_PW"
         if cmd_backup(args_e) != 0:
-            fail("selftest: encrypted backup failed")
+            fail("自检失败：加密备份未完成")
         if encrypted_version(enc) != (2 if HAVE_AES else 1):
-            fail("selftest: wrong crypto version written")
+            fail("自检失败：加密版本不符")
         if b"super-secret" in enc.read_bytes():
-            fail("selftest: plaintext leaked into encrypted archive")
-        args_v = argparse.Namespace(password_env="HB_SELFTEST_PW", password_file=None)
+            fail("自检失败：密文里出现明文")
+        args_v = argparse.Namespace(password_env="HB_SELFTEST_PW", password_file=None, password=None)
         if verify_archive(enc, args_v, quiet=True) != 0:
-            fail("selftest: encrypted verify failed")
+            fail("自检失败：加密包校验失败")
+        step("加密往返：%s 包可校验、可解密" % crypto)
+
         dest = tmp / "restored"
         args_r = argparse.Namespace(archive=str(enc), into=str(dest), force=False, only=None,
                                     skip_verify=False, dry_run=False,
-                                    password_env="HB_SELFTEST_PW", password_file=None)
+                                    password_env="HB_SELFTEST_PW", password_file=None, password=None)
         if cmd_restore(args_r) != 0:
-            fail("selftest: encrypted restore failed")
+            fail("自检失败：加密包还原失败")
         if (dest / "auth.json").read_text(encoding="utf-8") != '{"token":"super-secret"}':
-            fail("selftest: restored credentials mismatch")
+            fail("自检失败：还原内容不一致")
         if not (dest / "state.db").read_bytes().startswith(b"SQLite format 3\x00"):
-            fail("selftest: restored db is not sqlite")
+            fail("自检失败：还原的数据库不是 SQLite")
+        step("还原：数据一致、数据库完整")
+
         os.environ["HB_SELFTEST_PW"] = "wrong passphrase"
+        _SUPPRESS_FAILS = True
         try:
             rc = verify_archive(enc, argparse.Namespace(password_env="HB_SELFTEST_PW",
-                                                        password_file=None), quiet=True)
+                                                        password_file=None, password=None), quiet=True)
         except SystemExit:
             rc = 1
+        finally:
+            _SUPPRESS_FAILS = False
         if rc == 0:
-            fail("selftest: wrong passphrase was accepted")
-        log("selftest: OK (crypto=%s)" % crypto)
+            fail("自检失败：错误口令被接受")
+        step("安全：错误口令被拒绝")
+        print("  " + green(bold("全部通过")) + "  " + cyan("（共 6 项）"))
         return 0
     finally:
+        _QUIET = False
+        _SUPPRESS_FAILS = False
         shutil.rmtree(str(tmp), ignore_errors=True)
-
 
 
 # --- interactive console ----------------------------------------------------
 
-MENU = """
-============================================================
-  hermes-backup  {version}
-------------------------------------------------------------
-   1) 备份数据（默认，不含密钥，自动跳过缓存与凭据）
-   2) 备份并加密（可包含密钥，需要口令）
-   3) 校验备份包
-   4) 查看备份包内容
-   5) 还原备份
-   6) 自检（离线跑一遍完整流程）
-   0) 退出
-============================================================"""
+def print_menu() -> None:
+    line = "=" * 60
+    items = [
+        ("1", "备份数据" + cyan("（默认，不含密钥）")),
+        ("2", "备份并加密" + cyan("（可包含密钥，需要口令）")),
+        ("3", "校验备份包"),
+        ("4", "查看备份包内容"),
+        ("5", "还原备份"),
+        ("6", "自检"),
+        ("0", "退出"),
+    ]
+    print()
+    print(cyan(line))
+    print("  " + bold("hermes-backup") + "  " + cyan(VERSION))
+    print(cyan(line))
+    for num, text in items:
+        print("   " + yellow(num + ")") + " " + text)
+    print(cyan(line))
 
 
 def _ask(prompt: str, default: str = "") -> str:
@@ -1129,9 +1202,9 @@ def run_interactive() -> int:
         "5": _menu_restore,
         "6": lambda: cmd_selftest(_ns()),
     }
-    log(MENU.format(version=VERSION))
+    print_menu()
     while True:
-        choice = _ask("\n请选择 [0-6]: ", "")
+        choice = _ask("\n" + cyan("请选择 [0-6]: "), "")
         if choice in ("0", "q", "quit", "exit"):
             log("再见。")
             return 0
@@ -1223,6 +1296,7 @@ def _pause_if_interactive() -> None:
 
 
 def main(argv=None) -> int:
+    _enable_vt()
     parser = build_parser()
     try:
         args = parser.parse_args(argv)

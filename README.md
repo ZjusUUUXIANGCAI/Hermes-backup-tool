@@ -17,12 +17,16 @@ Hermes Agent 的**备份 / 校验 / 还原 / 迁移**工具。单文件，默认
 | 加密 | 无，压缩包即明文 | v2：AES-256-CTR + HMAC；错口令直接拒绝 |
 | 换机速度 | 要重拉最慢的 clone | `source` profile 保留 `.git`，免 clone |
 
+## 自检输出怎么看
+
+运行 `selftest`（或菜单里的 6）只会打印六行结果：默认备份、归档审计、路径校验、加密往返、还原、错误口令；全部打勾即代表工具在这台机器上工作正常。控制台支持 ANSI 时会带颜色（成功绿、警告黄、错误红）。
+
 ## 直接运行（免安装）
 
 | 平台 | 文件 | 用法 |
 | --- | --- | --- |
-| Windows x64（单文件，推荐） | `hermes-backup-0.3.2-win64.exe` | 直接运行，免解压（在 exe 同目录解压临时文件） |
-| Windows x64（目录版） | `hermes-backup-0.3.2-win64.zip` | 解压，运行 `hermes-backup\hermes-backup.exe` |
+| Windows x64（单文件，推荐） | `hermes-backup-0.3.3-win64.exe` | 直接运行，免解压（在 exe 同目录解压临时文件） |
+| Windows x64（目录版） | `hermes-backup-0.3.3-win64.zip` | 解压，运行 `hermes-backup\hermes-backup.exe` |
 | macOS / Linux / WSL | `hermes-backup.sh` + `hermes_backup.py` | 同一目录下 `chmod +x hermes-backup.sh`，然后 `./hermes-backup.sh --help` |
 | 任意平台（源码） | `hermes_backup.py` | `python hermes_backup.py --help` |
 

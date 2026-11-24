@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.3.3 - 2026-11-24
+
+### Changed
+- Console output is colorized (green success, yellow warnings, red errors, cyan headings)
+  with automatic fallback when the terminal does not support ANSI.
+- `selftest` now prints six concise steps instead of the internal backup log.
+- The interactive menu is colorized and grouped.
+
 ## 0.3.2 - 2026-11-24
 
 ### Added
