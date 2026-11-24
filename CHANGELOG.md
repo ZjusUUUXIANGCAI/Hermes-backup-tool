@@ -1,0 +1,37 @@
+# Changelog
+
+## 0.3.0 - 2026-11-24
+
+安全性与可靠性版本。
+
+### Added
+- Archive audit (verify/restore) now checks: duplicate zip entries, duplicate manifest paths,
+  entries missing from the archive, files not listed in the manifest, size mismatches,
+  sha256 mismatches, unsafe paths and manifest totals.
+- SQLite consistency: `state.db`, `kanban.db`, `projects.db`, `cron/executions.db` are
+  snapshotted through the SQLite backup API and pass `PRAGMA integrity_check` before archiving
+  (`--no-db-snapshot` opts out).
+- Encrypted format v2: AES-256-CTR + HMAC-SHA256 (encrypt-then-MAC), PBKDF2-SHA256.
+  Requires the optional `cryptography` package; v1 archives remain readable without it.
+- Path validation on create, verify and restore: drive letters, UNC/backslash paths,
+  `..`/`.` segments, control characters, trailing dots/spaces and reserved device names.
+- Restore refuses to write through symlinks/junctions and refuses to overwrite them.
+
+### Changed
+- Manifest format 2 (readers still accept format 1 archives from 0.2.x).
+- Hashing happens while writing the archive, so the manifest always describes stored bytes.
+- KDF iterations are bounded (50k..2M) and passphrase length is capped.
+- Archive header length is capped before parsing.
+
+### Fixed
+- A file modified between hashing and compression can no longer desynchronise the manifest.
+- Restore previously could overwrite a symlink target outside the destination.
+
+## 0.2.0 - 2026-11-24
+
+- Credentials excluded by default; config scrubbing; optional encrypted archives (v1).
+- `data`/`source`/`full` profiles, `verify`/`list`/`restore`/`selftest`.
+
+## 0.1.0 - 2026-11-24
+
+- Initial backup/restore/verify with manifest and sha256.

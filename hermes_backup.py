@@ -3,16 +3,19 @@
 
 Design rules
 ------------
-* Standard library only, Python 3.8+, Windows / macOS / Linux.
-* The default archive contains NO credentials: secret-bearing paths are skipped
+* Standard library only by default; AES-256-CTR (v2 archives) needs the optional
+  'cryptography' package, and v1 archives stay readable without it.
+* The default archive contains no credentials: secret-bearing paths are skipped
   and config-like files are scrubbed.
-* Credentials can be archived only on request (--with-secrets), and then the
-  archive must be encrypted (pure-Python, PBKDF2 + HMAC-SHA256 keystream).
+* Archives are written and hashed in a single pass, so the manifest always
+  describes the bytes that are actually stored.
+* Paths are validated on archive creation, verification and restore.
 """
 from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import getpass
 import hashlib
 import hmac
@@ -22,6 +25,7 @@ import platform
 import re
 import shutil
 import socket
+import sqlite3
 import struct
 import sys
 import tempfile
@@ -30,15 +34,25 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 TOOL = "hermes-backup"
-VERSION = "0.2.0"
-FORMAT = 1
+VERSION = "0.3.0"
+FORMAT = 2
 MANIFEST = "manifest.json"
-MAGIC = b"HBZ1"
-KDF_ITERS = 210000
+MAGIC1 = b"HBZ1"
+MAGIC2 = b"HBZ2"
 CHUNK = 1024 * 1024
+MAX_ENTRY_PATH = 4096
+MAX_HEADER = 8192
+MAX_PASSWORD = 1024
+MIN_ITERS, MAX_ITERS, DEFAULT_ITERS = 50_000, 2_000_000, 210_000
+
+try:  # optional: only needed for v2 (AES-256-CTR) archives
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+
+    HAVE_AES = True
+except Exception:  # pragma: no cover - exercised where cryptography is absent
+    HAVE_AES = False
 
 # --- profiles ---------------------------------------------------------------
-
 DATA_ITEMS = [
     "config.yaml", "SOUL.md", "auth.json", "install_id",
     "state.db", "kanban.db", "projects.db", "channel_directory.json",
@@ -47,37 +61,28 @@ DATA_ITEMS = [
     "platforms", "pairing", "cron", "bot_relay", "kanban",
 ]
 SOURCE_ITEMS = ["hermes-agent"]
-PROFILES = {
-    "data": DATA_ITEMS,
-    "source": SOURCE_ITEMS,
-    "full": DATA_ITEMS + SOURCE_ITEMS,
-}
+PROFILES = {"data": DATA_ITEMS, "source": SOURCE_ITEMS, "full": DATA_ITEMS + SOURCE_ITEMS}
 
-# Paths that can carry credentials; skipped unless --with-secrets.
 SECRET_ITEMS = [
-    "auth.json",
-    "gateway-connections.json",
-    "gateway_state.json",
-    "channel_directory.json",
-    "platforms",
-    "pairing",
-    "bot_relay",
+    "auth.json", "gateway-connections.json", "gateway_state.json",
+    "channel_directory.json", "platforms", "pairing", "bot_relay",
 ]
-
-# Files scrubbed in place when they are archived (value replacement, not deletion).
 SCRUB_NAMES = {"config.yaml", "channel_directory.json"}
 SCRUB_SUFFIXES = (".env", ".env.local", ".env.production")
-
-EXCLUDE_DIRS = {
-    ".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_cache",
-    "node_modules", ".git-rewrite", ".idea",
-}
+EXCLUDE_DIRS = {".venv", "venv", "__pycache__", ".mypy_cache", ".pytest_cache",
+                "node_modules", ".git-rewrite", ".idea"}
 EXCLUDE_NAMES = {"Thumbs.db", ".DS_Store"}
+EXCLUDE_SUFFIXES = (".lock", ".pid")
+
+WINDOWS_RESERVED = {"CON", "PRN", "AUX", "NUL", *[f"COM{i}" for i in range(1, 10)],
+                    *[f"LPT{i}" for i in range(1, 10)]}
 
 SECRET_ASSIGN = re.compile(
     r"(?im)^(\s*[\w.\-]*(?:token|secret|api[_-]?key|apikey|password|passwd|"
     r"access[_-]?key|bearer|authorization)[\w.\-]*\s*[:=]\s*)(.+?)(\s*(?:#.*)?)$")
 SECRET_INLINE = re.compile(r"(?i)\b(sk-[A-Za-z0-9_\-]{12,}|Bearer\s+[A-Za-z0-9._\-]{12,})")
+BOOLISH = re.compile(r"(?i)^(true|false|null|none|~|-?\d+(?:\.\d+)?)$")
+ENVREF = re.compile(r"^(\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_]*|env:[A-Za-z_][A-Za-z0-9_]*)$")
 
 
 def log(msg: str) -> None:
@@ -111,17 +116,63 @@ def default_home() -> Path:
     return Path.home() / ".hermes"
 
 
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(CHUNK), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
+
+# --- path safety ------------------------------------------------------------
+
+def validate_rel(rel: str) -> str:
+    """Reject anything that could escape the extraction root."""
+    if not rel or len(rel) > MAX_ENTRY_PATH:
+        fail("invalid archive path (empty or too long): %r" % (rel[:80],))
+    if "\\" in rel:
+        fail("invalid archive path (backslash): %r" % rel)
+    if rel.startswith("/"):
+        fail("invalid archive path (absolute): %r" % rel)
+    if re.match(r"^[A-Za-z]:", rel):
+        fail("invalid archive path (drive letter): %r" % rel)
+    if any(ord(ch) < 32 or ch == "\x7f" for ch in rel):
+        fail("invalid archive path (control character): %r" % rel)
+    segments = rel.split("/")
+    if any(seg in ("", ".", "..") for seg in segments):
+        fail("invalid archive path (relative segment): %r" % rel)
+    parts = PurePosixPath(rel).parts
+    if not parts:
+        fail("invalid archive path: %r" % rel)
+    for part in parts:
+        if part != part.rstrip(" ."):
+            fail("invalid archive path (trailing dot/space): %r" % rel)
+        if part.split(".")[0].upper() in WINDOWS_RESERVED:
+            fail("invalid archive path (reserved device name): %r" % rel)
+    return rel
+
+
+def is_reparse(path: Path) -> bool:
+    """True for symlinks and Windows junction/reparse points."""
+    try:
+        st = os.lstat(str(path))
+    except OSError:
+        return False
+    if path.is_symlink():
+        return True
+    return bool(getattr(st, "st_file_attributes", 0) & 0x400)
+
+
+def ensure_safe_target(target: Path, rel: str) -> Path:
+    """Walk the parents of rel under target and refuse reparse points."""
+    cur = target
+    for part in PurePosixPath(rel).parts[:-1]:
+        cur = cur / part
+        if cur.exists() and is_reparse(cur):
+            fail("refusing to write through a symlink/reparse point: %s" % cur)
+    dest = target / rel
+    if dest.exists() and is_reparse(dest):
+        fail("refusing to overwrite a symlink/reparse point: %s" % dest)
+    return dest
+
+
+# --- scrubbing --------------------------------------------------------------
 
 def is_secret_path(rel: str) -> bool:
     parts = PurePosixPath(rel).parts
@@ -131,15 +182,9 @@ def is_secret_path(rel: str) -> bool:
     return False
 
 
-BOOLISH = re.compile(r"(?i)^(true|false|null|none|~|-?\d+(?:\.\d+)?)$")
-ENVREF = re.compile(r"^(\$\{[^}]+\}|\$[A-Za-z_][A-Za-z0-9_]*|env:[A-Za-z_][A-Za-z0-9_]*)$")
-
-
 def scrub_text(text: str) -> str:
     def repl(m):
         value = m.group(2).strip().strip('"').strip("'")
-        # Booleans, numbers and ${ENV} references are configuration, not secrets:
-        # redacting them would change behaviour after restore.
         if BOOLISH.match(value) or ENVREF.match(value):
             return m.group(0)
         if len(value) < 8:
@@ -147,8 +192,7 @@ def scrub_text(text: str) -> str:
         return m.group(1) + '"<<REDACTED>>"' + m.group(3)
 
     text = SECRET_ASSIGN.sub(repl, text)
-    text = SECRET_INLINE.sub(lambda m: "<<REDACTED>>", text)
-    return text
+    return SECRET_INLINE.sub(lambda m: "<<REDACTED>>", text)
 
 
 def scrub_bytes(data: bytes) -> bytes:
@@ -164,14 +208,49 @@ def should_scrub(rel: str) -> bool:
     return name in SCRUB_NAMES or name.endswith(SCRUB_SUFFIXES)
 
 
-# --- crypto (PBKDF2-HMAC-SHA256 + HMAC keystream, encrypt-then-MAC) ---------
+# --- sqlite snapshots -------------------------------------------------------
+
+def is_sqlite(path: Path) -> bool:
+    try:
+        with open(str(path), "rb") as fh:
+            return fh.read(16) == b"SQLite format 3\x00"
+    except OSError:
+        return False
+
+
+def snapshot_sqlite(src: Path, workdir: Path) -> Path:
+    """Consistent snapshot through the SQLite backup API, then integrity check."""
+    dst = workdir / (src.name + ".snapshot")
+    if dst.exists():
+        dst.unlink()
+    row = None
+    src_con = sqlite3.connect("file:%s?mode=ro" % src.as_posix(), uri=True, timeout=30)
+    try:
+        dst_con = sqlite3.connect(str(dst))
+        try:
+            src_con.backup(dst_con)
+            row = dst_con.execute("PRAGMA integrity_check").fetchone()
+        finally:
+            dst_con.close()
+    finally:
+        src_con.close()
+    if not row or str(row[0]).lower() != "ok":
+        fail("integrity_check failed for %s: %r" % (src, row))
+    return dst
+
+
+# --- crypto -----------------------------------------------------------------
 
 def derive_keys(password: str, salt: bytes, iters: int):
+    if not password or len(password) > MAX_PASSWORD:
+        fail("passphrase must be 1..%d characters" % MAX_PASSWORD)
+    if not (MIN_ITERS <= iters <= MAX_ITERS):
+        fail("KDF iterations out of range: %d" % iters)
     dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iters, dklen=64)
     return dk[:32], dk[32:]
 
 
-def keystream(key: bytes, nonce: bytes, length: int, counter: int = 0) -> bytes:
+def keystream_v1(key: bytes, nonce: bytes, length: int, counter: int = 0) -> bytes:
     out = bytearray()
     while len(out) < length:
         out += hmac.new(key, nonce + struct.pack(">Q", counter), hashlib.sha256).digest()
@@ -179,20 +258,28 @@ def keystream(key: bytes, nonce: bytes, length: int, counter: int = 0) -> bytes:
     return bytes(out[:length])
 
 
-def is_encrypted(path: Path) -> bool:
+def encrypted_version(path: Path) -> int:
     try:
         with open(str(path), "rb") as fh:
-            return fh.read(4) == MAGIC
+            magic = fh.read(4)
     except OSError:
-        return False
+        return 0
+    if magic == MAGIC2:
+        return 2
+    if magic == MAGIC1:
+        return 1
+    return 0
 
 
-def encrypt_file(src: Path, dst: Path, password: str) -> None:
-    salt = os.urandom(16)
-    nonce = os.urandom(16)
-    enc_key, mac_key = derive_keys(password, salt, KDF_ITERS)
+def is_encrypted(path: Path) -> bool:
+    return encrypted_version(path) > 0
+
+
+def encrypt_file_v1(src: Path, dst: Path, password: str) -> None:
+    salt, nonce = os.urandom(16), os.urandom(16)
+    enc_key, mac_key = derive_keys(password, salt, DEFAULT_ITERS)
     header = json.dumps({
-        "v": 1, "kdf": "pbkdf2-sha256", "iters": KDF_ITERS,
+        "v": 1, "kdf": "pbkdf2-sha256", "iters": DEFAULT_ITERS,
         "salt": base64.b64encode(salt).decode("ascii"),
         "nonce": base64.b64encode(nonce).decode("ascii"),
     }).encode("utf-8")
@@ -200,14 +287,14 @@ def encrypt_file(src: Path, dst: Path, password: str) -> None:
     macd = hmac.new(mac_key, header, hashlib.sha256)
     counter = 0
     with open(str(src), "rb") as fin, open(str(tmp), "wb") as fout:
-        fout.write(MAGIC)
+        fout.write(MAGIC1)
         fout.write(struct.pack(">I", len(header)))
         fout.write(header)
         while True:
             chunk = fin.read(CHUNK)
             if not chunk:
                 break
-            ks = keystream(enc_key, nonce, len(chunk), counter)
+            ks = keystream_v1(enc_key, nonce, len(chunk), counter)
             counter += (len(chunk) + 31) // 32
             ct = bytes(a ^ b for a, b in zip(chunk, ks))
             macd.update(ct)
@@ -216,15 +303,13 @@ def encrypt_file(src: Path, dst: Path, password: str) -> None:
     os.replace(str(tmp), str(dst))
 
 
-def decrypt_file(src: Path, dst: Path, password: str) -> None:
+def decrypt_file_v1(src: Path, dst: Path, password: str) -> None:
     with open(str(src), "rb") as fin:
-        magic = fin.read(4)
-        if magic != MAGIC:
-            fail("not an encrypted hermes-backup archive: %s" % src)
-        raw_len = fin.read(4)
-        if len(raw_len) != 4:
-            fail("truncated archive header")
-        hlen = struct.unpack(">I", raw_len)[0]
+        if fin.read(4) != MAGIC1:
+            fail("not a v1 encrypted archive: %s" % src)
+        hlen = struct.unpack(">I", fin.read(4))[0]
+        if hlen > MAX_HEADER:
+            fail("archive header too large: %d bytes" % hlen)
         header = fin.read(hlen)
         try:
             meta = json.loads(header.decode("utf-8"))
@@ -232,10 +317,14 @@ def decrypt_file(src: Path, dst: Path, password: str) -> None:
             fail("corrupted archive header")
         salt = base64.b64decode(meta["salt"])
         nonce = base64.b64decode(meta["nonce"])
-        iters = int(meta.get("iters", KDF_ITERS))
+        if len(salt) != 16 or len(nonce) != 16:
+            fail("corrupted archive header (salt/nonce)")
+        iters = int(meta.get("iters", DEFAULT_ITERS))
         enc_key, mac_key = derive_keys(password, salt, iters)
         total = os.fstat(fin.fileno()).st_size
         body = total - 4 - 4 - hlen - 32
+        if body < 0:
+            fail("truncated archive")
         macd = hmac.new(mac_key, header, hashlib.sha256)
         tmp = dst.with_suffix(dst.suffix + ".part")
         counter = 0
@@ -247,9 +336,92 @@ def decrypt_file(src: Path, dst: Path, password: str) -> None:
                     fail("truncated archive body")
                 remaining -= len(chunk)
                 macd.update(chunk)
-                ks = keystream(enc_key, nonce, len(chunk), counter)
+                ks = keystream_v1(enc_key, nonce, len(chunk), counter)
                 counter += (len(chunk) + 31) // 32
                 fout.write(bytes(a ^ b for a, b in zip(chunk, ks)))
+            expected = fin.read(32)
+        if not hmac.compare_digest(macd.digest(), expected):
+            tmp.unlink()
+            fail("wrong passphrase or corrupted archive (authentication failed)")
+        os.replace(str(tmp), str(dst))
+
+
+def encrypt_file_v2(src: Path, dst: Path, password: str) -> None:
+    if not HAVE_AES:
+        fail("v2 archives need the optional 'cryptography' package "
+             "(pip install cryptography); use --crypto v1 to stay dependency-free")
+    salt, nonce = os.urandom(16), os.urandom(16)
+    enc_key, mac_key = derive_keys(password, salt, DEFAULT_ITERS)
+    header = json.dumps({
+        "v": 2, "alg": "aes-256-ctr+hmac-sha256", "kdf": "pbkdf2-sha256",
+        "iters": DEFAULT_ITERS,
+        "salt": base64.b64encode(salt).decode("ascii"),
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+    }).encode("utf-8")
+    encryptor = Cipher(algorithms.AES(enc_key), modes.CTR(nonce)).encryptor()
+    tmp = dst.with_suffix(dst.suffix + ".part")
+    macd = hmac.new(mac_key, header, hashlib.sha256)
+    with open(str(src), "rb") as fin, open(str(tmp), "wb") as fout:
+        fout.write(MAGIC2)
+        fout.write(struct.pack(">I", len(header)))
+        fout.write(header)
+        while True:
+            chunk = fin.read(CHUNK)
+            if not chunk:
+                break
+            ct = encryptor.update(chunk)
+            macd.update(ct)
+            fout.write(ct)
+        tail = encryptor.finalize()
+        if tail:
+            macd.update(tail)
+            fout.write(tail)
+        fout.write(macd.digest())
+    os.replace(str(tmp), str(dst))
+
+
+def decrypt_file_v2(src: Path, dst: Path, password: str) -> None:
+    if not HAVE_AES:
+        fail("this archive needs the optional 'cryptography' package "
+             "(pip install cryptography)")
+    with open(str(src), "rb") as fin:
+        if fin.read(4) != MAGIC2:
+            fail("not a v2 encrypted archive: %s" % src)
+        raw_len = fin.read(4)
+        if len(raw_len) != 4:
+            fail("truncated archive header")
+        hlen = struct.unpack(">I", raw_len)[0]
+        if hlen > MAX_HEADER:
+            fail("archive header too large: %d bytes" % hlen)
+        header = fin.read(hlen)
+        try:
+            meta = json.loads(header.decode("utf-8"))
+        except ValueError:
+            fail("corrupted archive header")
+        if meta.get("alg") != "aes-256-ctr+hmac-sha256":
+            fail("unsupported cipher: %r" % meta.get("alg"))
+        salt = base64.b64decode(meta.get("salt", ""))
+        nonce = base64.b64decode(meta.get("nonce", ""))
+        if len(salt) != 16 or len(nonce) != 16:
+            fail("corrupted archive header (salt/nonce)")
+        enc_key, mac_key = derive_keys(password, salt, int(meta.get("iters", DEFAULT_ITERS)))
+        total = os.fstat(fin.fileno()).st_size
+        body = total - 4 - 4 - hlen - 32
+        if body < 0:
+            fail("truncated archive")
+        macd = hmac.new(mac_key, header, hashlib.sha256)
+        decryptor = Cipher(algorithms.AES(enc_key), modes.CTR(nonce)).decryptor()
+        tmp = dst.with_suffix(dst.suffix + ".part")
+        remaining = body
+        with open(str(tmp), "wb") as fout:
+            while remaining > 0:
+                chunk = fin.read(min(CHUNK, remaining))
+                if not chunk:
+                    fail("truncated archive body")
+                remaining -= len(chunk)
+                macd.update(chunk)
+                fout.write(decryptor.update(chunk))
+            fout.write(decryptor.finalize())
             expected = fin.read(32)
         if not hmac.compare_digest(macd.digest(), expected):
             tmp.unlink()
@@ -262,21 +434,35 @@ def resolve_password(args, confirm: bool = False) -> str:
         value = os.environ.get(args.password_env)
         if not value:
             fail("environment variable %s is empty" % args.password_env)
+        if len(value) > MAX_PASSWORD:
+            fail("passphrase too long")
         return value
     if getattr(args, "password_file", None):
-        return Path(args.password_file).expanduser().read_text(encoding="utf-8").strip()
+        value = Path(args.password_file).expanduser().read_text(encoding="utf-8").strip()
+        if not value:
+            fail("password file is empty")
+        if len(value) > MAX_PASSWORD:
+            fail("passphrase too long")
+        return value
     if not sys.stdin.isatty():
         fail("no passphrase available: pass --password-env or --password-file "
              "(stdin is not a terminal)")
     pw = getpass.getpass("passphrase: ")
     if not pw:
         fail("empty passphrase")
+    if len(pw) > MAX_PASSWORD:
+        fail("passphrase too long")
     if confirm and getpass.getpass("repeat passphrase: ") != pw:
         fail("passphrases do not match")
     return pw
 
 
-# --- selection and archive writing ------------------------------------------
+# --- selection --------------------------------------------------------------
+
+def fnmatch(name: str, pattern: str) -> bool:
+    import fnmatch as _fn
+    return _fn.fnmatch(name, pattern)
+
 
 def iter_selected(home: Path, items, extra_exclude):
     seen = set()
@@ -293,7 +479,7 @@ def iter_selected(home: Path, items, extra_exclude):
         for dirpath, dirnames, filenames in os.walk(str(top)):
             dirnames[:] = sorted(d for d in dirnames if d not in EXCLUDE_DIRS)
             for name in sorted(filenames):
-                if name in EXCLUDE_NAMES or name.endswith((".lock", ".pid")):
+                if name in EXCLUDE_NAMES or name.endswith(EXCLUDE_SUFFIXES):
                     continue
                 p = Path(dirpath) / name
                 rel = p.relative_to(home).as_posix()
@@ -305,13 +491,35 @@ def iter_selected(home: Path, items, extra_exclude):
                 yield p, rel
 
 
-def fnmatch(name: str, pattern: str) -> bool:
-    import fnmatch as _fn
-    return _fn.fnmatch(name, pattern)
+def collect(home: Path, items, extra_exclude, with_secrets, scrub,
+            db_snapshot, workdir: Path):
+    files, skipped, snapshots = [], 0, 0
+    for src, rel in iter_selected(home, items, extra_exclude):
+        if not with_secrets and is_secret_path(rel):
+            skipped += 1
+            continue
+        if db_snapshot and src.name.lower().endswith((".db", ".sqlite", ".sqlite3")) and is_sqlite(src):
+            try:
+                src = snapshot_sqlite(src, workdir)
+                snapshots += 1
+            except SystemExit:
+                raise
+            except Exception as exc:
+                fail("cannot snapshot %s: %s" % (rel, exc))
+        data = None
+        if scrub and should_scrub(rel) and src.stat().st_size <= 2 * 1024 * 1024:
+            try:
+                data = scrub_bytes(src.read_bytes())
+            except OSError as exc:
+                warn("cannot read %s: %s" % (rel, exc))
+                continue
+        files.append({"src": src, "rel": rel, "data": data})
+    return files, skipped, snapshots
 
+
+# --- archive writing --------------------------------------------------------
 
 def hermes_version(home: Path) -> str:
-    import re as _re
     candidates = [
         (home / "hermes-agent" / "pyproject.toml", r'(?m)^\s*version\s*=\s*"([^"]+)"'),
         (home / "hermes-build.json", r'"version"\s*:\s*"([^"]+)"'),
@@ -321,7 +529,7 @@ def hermes_version(home: Path) -> str:
             text = path.read_text(encoding="utf-8", errors="replace")
         except OSError:
             continue
-        m = _re.search(pattern, text)
+        m = re.search(pattern, text)
         if m:
             version = m.group(1)
             if version and version != "0.0.0":
@@ -329,39 +537,7 @@ def hermes_version(home: Path) -> str:
     return "unknown"
 
 
-def collect(home: Path, items, extra_exclude, do_hash, with_secrets, scrub,
-            quiet=False):
-    files = []
-    total = 0
-    skipped = 0
-    unreadable = 0
-    for src, rel in iter_selected(home, items, extra_exclude):
-        if not with_secrets and is_secret_path(rel):
-            skipped += 1
-            continue
-        data = None
-        try:
-            if scrub and should_scrub(rel) and src.stat().st_size <= 2 * 1024 * 1024:
-                data = scrub_bytes(src.read_bytes())
-        except OSError as exc:
-            warn("cannot read %s: %s" % (rel, exc))
-            unreadable += 1
-            continue
-        size = len(data) if data is not None else src.stat().st_size
-        entry = {"path": rel, "size": size}
-        if do_hash:
-            try:
-                entry["sha256"] = sha256_bytes(data) if data is not None else sha256_file(src)
-            except OSError as exc:
-                warn("cannot hash %s: %s" % (rel, exc))
-                unreadable += 1
-                continue
-        files.append({"src": src, "rel": rel, "data": data, "entry": entry})
-        total += size
-    return files, total, skipped, unreadable
-
-
-def build_manifest(entries, profile, home, secrets, anon):
+def build_manifest(entries, profile, home, secrets, anon, crypto):
     host = {"platform": platform.platform(), "python": platform.python_version()}
     if anon:
         host["hostname"] = "hidden"
@@ -376,7 +552,8 @@ def build_manifest(entries, profile, home, secrets, anon):
         "created_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "profile": profile,
         "includes_secrets": bool(secrets),
-        "encrypted": False,
+        "encrypted": bool(crypto),
+        "crypto": crypto,
         "anonymized": bool(anon),
         "hermes_version": hermes_version(home),
         "host": host,
@@ -386,18 +563,35 @@ def build_manifest(entries, profile, home, secrets, anon):
     }
 
 
-def write_zip(out: Path, files, manifest) -> None:
+def write_archive(out: Path, files, make_manifest):
+    """Stream every file into the zip while hashing the exact stored bytes."""
     tmp = out.with_suffix(out.suffix + ".part")
+    entries = []
     with zipfile.ZipFile(str(tmp), "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
         for i, item in enumerate(files, 1):
+            rel = item["rel"]
             if item["data"] is not None:
-                zf.writestr(item["rel"], item["data"])
+                data = item["data"]
+                zf.writestr(rel, data)
+                entries.append({"path": rel, "size": len(data), "sha256": sha256_bytes(data)})
             else:
-                zf.write(str(item["src"]), item["rel"])
+                digest = hashlib.sha256()
+                size = 0
+                with open(str(item["src"]), "rb") as fin, zf.open(rel, "w") as fout:
+                    while True:
+                        chunk = fin.read(CHUNK)
+                        if not chunk:
+                            break
+                        fout.write(chunk)
+                        digest.update(chunk)
+                        size += len(chunk)
+                entries.append({"path": rel, "size": size, "sha256": digest.hexdigest()})
             if i % 500 == 0:
                 log("  archived %d files..." % i)
+        manifest = make_manifest(entries)
         zf.writestr(MANIFEST, json.dumps(manifest, indent=2, ensure_ascii=False))
     os.replace(str(tmp), str(out))
+    return manifest
 
 
 def read_manifest(zf: zipfile.ZipFile):
@@ -406,30 +600,29 @@ def read_manifest(zf: zipfile.ZipFile):
     except KeyError:
         fail("archive has no %s; not a hermes-backup archive" % MANIFEST)
     try:
-        return json.loads(raw.decode("utf-8"))
+        man = json.loads(raw.decode("utf-8"))
     except ValueError as exc:
         fail("manifest.json is not valid JSON: %s" % exc)
-
-
-def safe_rel(rel: str) -> str:
-    p = PurePosixPath(rel)
-    if p.is_absolute() or ".." in p.parts or not p.parts:
-        fail("refusing unsafe path in archive: %r" % rel)
-    return rel
-
-
-import contextlib
+    if man.get("tool") != TOOL:
+        fail("archive was not produced by %s" % TOOL)
+    if man.get("format") not in (1, FORMAT):
+        fail("unsupported archive format: %r" % man.get("format"))
+    return man
 
 
 @contextlib.contextmanager
 def open_archive(path: Path, args):
-    if is_encrypted(path):
+    version = encrypted_version(path)
+    if version:
         password = resolve_password(args)
         fd, tmp_name = tempfile.mkstemp(prefix="hermes-backup-dec-", suffix=".zip")
         os.close(fd)
         tmp = Path(tmp_name)
         try:
-            decrypt_file(path, tmp, password)
+            if version == 2:
+                decrypt_file_v2(path, tmp, password)
+            else:
+                decrypt_file_v1(path, tmp, password)
             with zipfile.ZipFile(str(tmp)) as zf:
                 yield zf
         finally:
@@ -442,104 +635,190 @@ def open_archive(path: Path, args):
             yield zf
 
 
+# --- audit ------------------------------------------------------------------
+
+def audit_archive(zf: zipfile.ZipFile, man, only=None):
+    """Structural + content audit. Returns (checked, problems)."""
+    from collections import Counter
+
+    problems = []
+    names = zf.namelist()
+    lowered = Counter(n.lower() for n in names)
+    for name, count in lowered.items():
+        if count > 1:
+            problems.append("duplicate zip entry: %s" % name)
+
+    entries = man.get("entries")
+    if not isinstance(entries, list):
+        problems.append("manifest.entries is not a list")
+        return 0, problems
+
+    seen = Counter()
+    declared = set()
+    for entry in entries:
+        rel = entry.get("path")
+        if not isinstance(rel, str):
+            problems.append("manifest entry without a string path")
+            continue
+        seen[rel.lower()] += 1
+        try:
+            validate_rel(rel)
+        except SystemExit:
+            problems.append("manifest entry has an unsafe path: %r" % rel[:80])
+            continue
+        declared.add(rel)
+    for name, count in seen.items():
+        if count > 1:
+            problems.append("duplicate manifest path: %s" % name)
+
+    checked = 0
+    for entry in entries:
+        rel = entry.get("path")
+        if only and not str(rel).startswith(only):
+            continue
+        if not isinstance(rel, str) or rel not in names:
+            problems.append("missing from archive: %s" % rel)
+            continue
+        info = zf.getinfo(rel)
+        expected_size = entry.get("size")
+        if isinstance(expected_size, int) and info.file_size != expected_size:
+            problems.append("size mismatch: %s (manifest %d, archive %d)"
+                            % (rel, expected_size, info.file_size))
+        expected_hash = entry.get("sha256")
+        if expected_hash:
+            digest = hashlib.sha256()
+            try:
+                with zf.open(info) as fh:
+                    for chunk in iter(lambda: fh.read(CHUNK), b""):
+                        digest.update(chunk)
+            except (zipfile.BadZipFile, RuntimeError) as exc:
+                problems.append("cannot read %s: %s" % (rel, exc))
+                continue
+            if digest.hexdigest() != expected_hash:
+                problems.append("hash mismatch: %s" % rel)
+        checked += 1
+
+    for name in names:
+        if name == MANIFEST or name in declared:
+            continue
+        problems.append("not listed in manifest: %s" % name)
+
+    totals = man.get("totals") or {}
+    if isinstance(totals.get("files"), int) and totals["files"] != len(entries):
+        problems.append("manifest totals.files does not match entries")
+    total_bytes = sum(e.get("size", 0) for e in entries if isinstance(e.get("size"), int))
+    if isinstance(totals.get("bytes"), int) and totals["bytes"] != total_bytes:
+        problems.append("manifest totals.bytes does not match entries")
+
+    return checked, problems
+
+
+# --- commands ---------------------------------------------------------------
+
 def cmd_backup(args) -> int:
     home = Path(args.home).expanduser() if args.home else default_home()
     if not home.is_dir():
         fail("Hermes home not found: %s (use --home to point at it)" % home)
-    if args.with_secrets and not args.encrypt and not args.allow_plaintext_secrets:
+    crypto = None
+    if args.encrypt:
+        crypto = args.crypto
+        if crypto == "v2" and not HAVE_AES:
+            fail("--crypto v2 needs the optional 'cryptography' package; "
+                 "use --crypto v1 or install it")
+    if args.with_secrets and not crypto and not args.allow_plaintext_secrets:
         fail("--with-secrets would write credentials in plaintext; add --encrypt "
              "(or --allow-plaintext-secrets if you really mean it)")
-    password = resolve_password(args, confirm=True) if args.encrypt else None
-    scrub = not args.no_scrub
-    items = list(PROFILES[args.profile])
-    log("backup: %s profile from %s" % (args.profile, home))
-    log("secrets: %s   scrub: %s   hash: %s   encrypt: %s" % (
-        "included" if args.with_secrets else "excluded",
-        "on" if scrub else "off",
-        "on" if not args.no_hash else "off",
-        "yes" if args.encrypt else "no"))
-    files, total, skipped, unreadable = collect(
-        home, items, args.exclude, not args.no_hash, args.with_secrets, scrub)
-    if not files:
-        fail("nothing to back up; check --home and the profile")
-    if skipped:
-        log("skipped %d credential-bearing item(s)" % skipped)
-    secrets = any(is_secret_path(f["rel"]) for f in files)
-    entries = [f["entry"] for f in files]
-    out = Path(args.out).expanduser() if args.out else (
-        Path.cwd() / ("hermes-backup-%s-%s%s" % (
-            args.profile, time.strftime("%Y%m%d-%H%M%S"), ".hbz" if args.encrypt else ".zip")))
-    if out.exists() and not args.force:
-        fail("%s exists; pass --force to overwrite" % out)
-    if args.encrypt and out.suffix.lower() != ".hbz":
-        out = out.with_suffix(".hbz")
-    if args.dry_run:
-        log("dry-run: would archive %d files, %s raw%s" % (
-            len(entries), human(total), " (encrypted)" if args.encrypt else ""))
-        return 0
-    manifest = build_manifest(entries, args.profile, home, secrets, args.anonymize)
-    manifest["encrypted"] = bool(args.encrypt)
-    log("archiving %d files, %s..." % (len(entries), human(total)))
-    if args.encrypt:
-        fd, tmp_name = tempfile.mkstemp(prefix="hermes-backup-enc-", suffix=".zip")
-        os.close(fd)
-        tmp = Path(tmp_name)
-        try:
-            write_zip(tmp, files, manifest)
-            log("encrypting (pbkdf2-sha256, %d iterations)..." % KDF_ITERS)
-            encrypt_file(tmp, out, password or "")
-        finally:
+    password = resolve_password(args, confirm=True) if crypto else None
+
+    workdir = Path(tempfile.mkdtemp(prefix="hermes-backup-work-"))
+    try:
+        files, skipped, snapshots = collect(
+            home, PROFILES[args.profile], args.exclude, args.with_secrets,
+            not args.no_scrub, (not args.dry_run) and args.db_snapshot, workdir)
+        if not files:
+            fail("nothing to back up; check --home and the profile")
+        secrets = any(is_secret_path(f["rel"]) for f in files)
+        if secrets and not crypto and not args.allow_plaintext_secrets:
+            fail("this selection would include credentials in plaintext")
+
+        log("backup: %s profile from %s" % (args.profile, home))
+        log("secrets: %s   scrub: %s   db-snapshot: %s   crypto: %s" % (
+            "included" if args.with_secrets else "excluded",
+            "off" if args.no_scrub else "on",
+            "off" if not args.db_snapshot else ("%d db(s) snapshotted" % snapshots if not args.dry_run else "planned"),
+            crypto or "no"))
+        if skipped:
+            log("skipped %d credential-bearing item(s)" % skipped)
+
+        if args.dry_run:
+            total = sum(f["src"].stat().st_size if f["data"] is None else len(f["data"]) for f in files)
+            log("dry-run: would archive %d files, %s raw" % (len(files), human(total)))
+            return 0
+
+        suffix = ".hbz" if crypto else ".zip"
+        out = Path(args.out).expanduser() if args.out else (
+            Path.cwd() / ("hermes-backup-%s-%s%s" % (
+                args.profile, time.strftime("%Y%m%d-%H%M%S"), suffix)))
+        if args.encrypt and out.suffix.lower() != ".hbz":
+            out = out.with_suffix(".hbz")
+        if out.exists() and not args.force:
+            fail("%s exists; pass --force to overwrite" % out)
+
+        def make_manifest(entries):
+            return build_manifest(entries, args.profile, home, secrets, args.anonymize, crypto)
+
+        if crypto:
+            fd, tmp_name = tempfile.mkstemp(prefix="hermes-backup-enc-", suffix=".zip")
+            os.close(fd)
+            plain = Path(tmp_name)
             try:
-                tmp.unlink()
-            except OSError:
-                pass
-    else:
-        write_zip(out, files, manifest)
-    log("")
-    log("written: %s (%s)" % (out, human(out.stat().st_size)))
-    log("files: %d   raw: %s   secrets: %s   encrypted: %s" % (
-        len(entries), human(total), "yes" if secrets else "no",
-        "yes" if args.encrypt else "no"))
-    if unreadable:
-        warn("%d file(s) could not be read and were skipped" % unreadable)
-        return 2
-    return 0
+                log("archiving %d files..." % len(files))
+                manifest = write_archive(plain, files, make_manifest)
+                log("encrypting (%s, pbkdf2-sha256 %d)..." % (crypto, DEFAULT_ITERS))
+                if crypto == "v2":
+                    encrypt_file_v2(plain, out, password or "")
+                else:
+                    encrypt_file_v1(plain, out, password or "")
+            finally:
+                try:
+                    plain.unlink()
+                except OSError:
+                    pass
+        else:
+            log("archiving %d files..." % len(files))
+            manifest = write_archive(out, files, make_manifest)
+
+        log("")
+        log("written: %s (%s)" % (out, human(out.stat().st_size)))
+        log("files: %d   raw: %s   secrets: %s   crypto: %s" % (
+            len(manifest["entries"]), human(manifest["totals"]["bytes"]),
+            "yes" if secrets else "no", crypto or "no"))
+        return 0
+    finally:
+        shutil.rmtree(str(workdir), ignore_errors=True)
 
 
 def verify_archive(archive: Path, args, only=None, quiet=False) -> int:
     with open_archive(archive, args) as zf:
         man = read_manifest(zf)
-        bad = missing = checked = 0
-        for entry in man.get("entries", []):
-            rel = entry["path"]
-            if only and not rel.startswith(only):
-                continue
-            try:
-                info = zf.getinfo(rel)
-            except KeyError:
-                missing += 1
-                warn("missing from archive: %s" % rel)
-                continue
-            expected = entry.get("sha256")
-            if expected:
-                h = hashlib.sha256()
-                with zf.open(info) as fh:
-                    for chunk in iter(lambda: fh.read(CHUNK), b""):
-                        h.update(chunk)
-                if h.hexdigest() != expected:
-                    bad += 1
-                    warn("hash mismatch: %s" % rel)
-            checked += 1
-        if not quiet:
-            log("package: %s%s" % (archive, " (encrypted)" if man.get("encrypted") else ""))
-            log("profile: %s   created: %s   hermes: %s" % (
-                man.get("profile"), man.get("created_utc"), man.get("hermes_version")))
-            log("secrets: %s   anonymized: %s" % (
-                "yes" if man.get("includes_secrets") else "no",
-                "yes" if man.get("anonymized") else "no"))
-            log("entries: %d   checked: %d" % (len(man.get("entries", [])), checked))
-            log("result: %s" % ("OK" if not (bad or missing) else "FAILED"))
-        return 0 if not (bad or missing) else 1
+        checked, problems = audit_archive(zf, man, only)
+    if not quiet:
+        log("package: %s%s" % (archive, " (encrypted %s)" % (man.get("crypto") or "v?")
+                              if man.get("encrypted") else ""))
+        log("profile: %s   created: %s   hermes: %s   format: %s" % (
+            man.get("profile"), man.get("created_utc"),
+            man.get("hermes_version"), man.get("format")))
+        log("secrets: %s   anonymized: %s" % (
+            "yes" if man.get("includes_secrets") else "no",
+            "yes" if man.get("anonymized") else "no"))
+        log("entries: %d   checked: %d   problems: %d" % (
+            len(man.get("entries", [])), checked, len(problems)))
+        for p in problems[:20]:
+            warn(p)
+        if len(problems) > 20:
+            warn("... and %d more problem(s)" % (len(problems) - 20))
+        log("result: %s" % ("OK" if not problems else "FAILED"))
+    return 0 if not problems else 1
 
 
 def cmd_verify(args) -> int:
@@ -550,7 +829,9 @@ def cmd_list(args) -> int:
     archive = Path(args.archive).expanduser()
     with open_archive(archive, args) as zf:
         man = read_manifest(zf)
-        log("package:      %s%s" % (args.archive, " (encrypted)" if man.get("encrypted") else ""))
+        log("package:      %s%s" % (args.archive,
+                                    " (encrypted %s)" % (man.get("crypto") or "v?")
+                                    if man.get("encrypted") else ""))
         log("tool:         %s %s (format %s)" % (
             man.get("tool"), man.get("tool_version"), man.get("format")))
         log("profile:      %s" % man.get("profile"))
@@ -564,7 +845,7 @@ def cmd_list(args) -> int:
         log("contents:     %s files, %s" % (totals.get("files"), human(totals.get("bytes", 0))))
         tops = {}
         for entry in man.get("entries", []):
-            top = entry["path"].split("/")[0]
+            top = str(entry.get("path", "")).split("/")[0]
             tops[top] = tops.get(top, 0) + 1
         log("top level:")
         for name in sorted(tops):
@@ -577,48 +858,37 @@ def cmd_restore(args) -> int:
     target = Path(args.into).expanduser() if args.into else default_home()
     with open_archive(archive, args) as zf:
         man = read_manifest(zf)
-        if man.get("format") != FORMAT:
-            fail("unsupported archive format: %r" % man.get("format"))
+        checked, problems = audit_archive(zf, man, args.only)
+        if problems:
+            for p in problems[:20]:
+                warn(p)
+            fail("archive failed its integrity audit (%d problem(s)); restore aborted"
+                 % len(problems))
         entries = [e for e in man.get("entries", [])
-                   if not args.only or e["path"].startswith(args.only)]
+                   if not args.only or str(e["path"]).startswith(args.only)]
         if not entries:
             fail("nothing selected to restore")
-        names = set(zf.namelist())
+
         conflicts = []
         for entry in entries:
-            rel = safe_rel(entry["path"])
-            if rel not in names:
-                fail("archive is missing %s; run verify first" % rel)
-            if (target / rel).exists():
-                conflicts.append(rel)
+            dest = ensure_safe_target(target, validate_rel(entry["path"]))
+            if dest.exists():
+                conflicts.append(entry["path"])
         if conflicts and not args.force:
             warn("%d file(s) already exist under %s" % (len(conflicts), target))
             for rel in conflicts[:10]:
                 warn("  " + rel)
             fail("refusing to overwrite; pass --force (or --into a fresh directory)")
-        if not args.skip_verify:
-            bad = 0
-            for entry in entries:
-                expected = entry.get("sha256")
-                if not expected:
-                    continue
-                h = hashlib.sha256()
-                with zf.open(entry["path"]) as fh:
-                    for chunk in iter(lambda: fh.read(CHUNK), b""):
-                        h.update(chunk)
-                if h.hexdigest() != expected:
-                    bad += 1
-                    warn("hash mismatch: %s" % entry["path"])
-            if bad:
-                fail("%d file(s) failed verification; restore aborted" % bad)
+
         if args.dry_run:
             log("would restore %d file(s) into %s" % (len(entries), target))
             return 0
+
         target.mkdir(parents=True, exist_ok=True)
         restored = 0
         for entry in entries:
-            rel = safe_rel(entry["path"])
-            dest = target / rel
+            rel = validate_rel(entry["path"])
+            dest = ensure_safe_target(target, rel)
             dest.parent.mkdir(parents=True, exist_ok=True)
             tmp = dest.with_name(dest.name + ".hermes-restore-part")
             with zf.open(rel) as src, open(str(tmp), "wb") as out:
@@ -641,26 +911,34 @@ def cmd_selftest(args) -> int:
         (home / "platforms").mkdir()
         (home / "config.yaml").write_text(
             "model:\n  default: test\n  api_key: sk-abcdef1234567890xyz\n"
-            "  redact_secrets: true\n  base_key: \"${SOME_ENV}\"\n"
-            "telegram_token: 123456:AAAAsecret\n",
-            encoding="utf-8")
+            "  redact_secrets: true\n"
+            "telegram_token: 123456:AAAAsecret\n", encoding="utf-8")
         (home / "auth.json").write_text('{"token":"super-secret"}', encoding="utf-8")
         (home / "platforms" / "creds.json").write_text('{"t":"x"}', encoding="utf-8")
         (home / "sessions" / "a.json").write_text("hello", encoding="utf-8")
         (home / "skills" / "demo" / "SKILL.md").write_text("# demo\n", encoding="utf-8")
+        db = home / "state.db"
+        con = sqlite3.connect(str(db))
+        con.execute("CREATE TABLE t (v TEXT)")
+        con.execute("INSERT INTO t VALUES ('hello')")
+        con.commit()
+        con.close()
         (home / "cache").mkdir()
         (home / "cache" / "huge.bin").write_bytes(b"x" * 4096)
 
         base = dict(home=str(home), profile="data", force=False, no_hash=False,
-                    exclude=[], dry_run=False)
+                    exclude=[], dry_run=False, no_scrub=False, anonymize=False,
+                    db_snapshot=True, allow_plaintext_secrets=False,
+                    password_env=None, password_file=None)
+
         plain = tmp / "plain.zip"
-        args_p = argparse.Namespace(with_secrets=False, encrypt=False, no_scrub=False,
-                                    anonymize=False, allow_plaintext_secrets=False,
-                                    out=str(plain), password_env=None, password_file=None, **base)
+        args_p = argparse.Namespace(with_secrets=False, encrypt=False, crypto="v2",
+                                    out=str(plain), **base)
         if cmd_backup(args_p) != 0:
             fail("selftest: plain backup failed")
         with zipfile.ZipFile(str(plain)) as zf:
             names = set(zf.namelist())
+            man = read_manifest(zf)
             if "auth.json" in names or "platforms/creds.json" in names:
                 fail("selftest: credentials leaked into default archive")
             cfg = zf.read("config.yaml").decode("utf-8")
@@ -668,20 +946,45 @@ def cmd_selftest(args) -> int:
                 fail("selftest: config.yaml was not scrubbed")
             if "redact_secrets: true" not in cfg:
                 fail("selftest: boolean setting was redacted by mistake")
-            if "${SOME_ENV}" not in cfg:
-                fail("selftest: environment reference was redacted by mistake")
-            if "cache/huge.bin" in names:
-                fail("selftest: cache should not be archived")
+            checked, problems = audit_archive(zf, man)
+            if problems:
+                fail("selftest: audit found problems: %r" % problems[:3])
+            snap = zf.read("state.db")
+            if not snap.startswith(b"SQLite format 3\x00"):
+                fail("selftest: state.db was not snapshotted")
+
+        # traversal + duplicate detection on a crafted archive
+        bad = tmp / "bad.zip"
+        with zipfile.ZipFile(str(bad), "w") as zf:
+            zf.writestr("safe.txt", "x")
+            zf.writestr("../evil.txt", "x")
+            zf.writestr("safe.txt", "y")
+        with zipfile.ZipFile(str(bad)) as zf:
+            man = {"tool": TOOL, "format": FORMAT, "entries": [], "totals": {"files": 0, "bytes": 0}}
+            _, problems = audit_archive(zf, man)
+            joined = " ".join(problems)
+            if "duplicate zip entry" not in joined:
+                fail("selftest: duplicate zip entries were not detected")
+            if "not listed in manifest" not in joined:
+                fail("selftest: unlisted entries were not detected")
+
+        for evil in ("../x", "/abs", "C:/x", "a\\\\b", "CON", "a..", "x/../../y"):
+            try:
+                validate_rel(evil)
+            except SystemExit:
+                continue
+            fail("selftest: unsafe path accepted: %r" % evil)
+
+        crypto = "v2" if HAVE_AES else "v1"
         enc = tmp / "enc.hbz"
-        args_e = argparse.Namespace(with_secrets=True, encrypt=True, no_scrub=False,
-                                    anonymize=True, allow_plaintext_secrets=False,
-                                    out=str(enc), password_env="HB_SELFTEST_PW", password_file=None,
-                                    **base)
         os.environ["HB_SELFTEST_PW"] = "correct horse battery staple"
+        args_e = argparse.Namespace(with_secrets=True, encrypt=True, crypto=crypto,
+                                    out=str(enc), **base)
+        args_e.password_env = "HB_SELFTEST_PW"
         if cmd_backup(args_e) != 0:
             fail("selftest: encrypted backup failed")
-        if not is_encrypted(enc):
-            fail("selftest: archive is not encrypted")
+        if encrypted_version(enc) != (2 if HAVE_AES else 1):
+            fail("selftest: wrong crypto version written")
         if b"super-secret" in enc.read_bytes():
             fail("selftest: plaintext leaked into encrypted archive")
         args_v = argparse.Namespace(password_env="HB_SELFTEST_PW", password_file=None)
@@ -695,6 +998,8 @@ def cmd_selftest(args) -> int:
             fail("selftest: encrypted restore failed")
         if (dest / "auth.json").read_text(encoding="utf-8") != '{"token":"super-secret"}':
             fail("selftest: restored credentials mismatch")
+        if not (dest / "state.db").read_bytes().startswith(b"SQLite format 3\x00"):
+            fail("selftest: restored db is not sqlite")
         os.environ["HB_SELFTEST_PW"] = "wrong passphrase"
         try:
             rc = verify_archive(enc, argparse.Namespace(password_env="HB_SELFTEST_PW",
@@ -703,7 +1008,7 @@ def cmd_selftest(args) -> int:
             rc = 1
         if rc == 0:
             fail("selftest: wrong passphrase was accepted")
-        log("selftest: OK")
+        log("selftest: OK (crypto=%s)" % crypto)
         return 0
     finally:
         shutil.rmtree(str(tmp), ignore_errors=True)
@@ -728,12 +1033,15 @@ def build_parser() -> argparse.ArgumentParser:
     b.add_argument("--with-secrets", action="store_true",
                    help="include credential-bearing files (requires --encrypt)")
     b.add_argument("--encrypt", action="store_true", help="encrypt the archive with a passphrase")
+    b.add_argument("--crypto", choices=["v1", "v2"], default="v2",
+                   help="v2 = AES-256-CTR + HMAC (needs cryptography); v1 = stdlib only")
     b.add_argument("--allow-plaintext-secrets", action="store_true",
                    help="allow --with-secrets without encryption (not recommended)")
     b.add_argument("--no-scrub", action="store_true",
                    help="do not redact secret-like values inside config files")
+    b.add_argument("--no-db-snapshot", action="store_false", dest="db_snapshot", default=True,
+                   help="archive SQLite files as-is instead of a consistent snapshot")
     b.add_argument("--anonymize", action="store_true", help="hide hostname and home path in the manifest")
-    b.add_argument("--no-hash", action="store_true", help="skip sha256 (faster, weaker verify)")
     b.add_argument("--exclude", action="append", default=[], metavar="GLOB",
                    help="extra relative glob(s) to skip, repeatable")
     b.add_argument("--dry-run", action="store_true", help="report what would be archived, write nothing")
@@ -741,7 +1049,7 @@ def build_parser() -> argparse.ArgumentParser:
     secret_flags(b)
     b.set_defaults(func=cmd_backup)
 
-    v = sub.add_parser("verify", help="check an archive against its manifest")
+    v = sub.add_parser("verify", help="audit an archive against its manifest")
     v.add_argument("archive")
     v.add_argument("--only", help="verify only paths under this prefix")
     secret_flags(v)
@@ -757,7 +1065,7 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--into", help="target directory (default: detected Hermes home)")
     r.add_argument("--only", help="restore only paths under this prefix")
     r.add_argument("--force", action="store_true", help="overwrite existing files")
-    r.add_argument("--skip-verify", action="store_true", help="do not re-check hashes")
+    r.add_argument("--skip-verify", action="store_true", help="(deprecated) audit always runs")
     r.add_argument("--dry-run", action="store_true", help="report, write nothing")
     secret_flags(r)
     r.set_defaults(func=cmd_restore)

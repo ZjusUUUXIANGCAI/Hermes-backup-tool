@@ -2,7 +2,7 @@
 
 [![ci](https://github.com/ZjusUUUXIANGCAI/Hermes-backup-tool/actions/workflows/ci.yml/badge.svg)](https://github.com/ZjusUUUXIANGCAI/Hermes-backup-tool/actions/workflows/ci.yml)
 
-Hermes Agent 的**备份 / 校验 / 还原 / 迁移**工具。单文件、零依赖、只用 Python 标准库（3.8+），Windows / macOS / Linux 通用。
+Hermes Agent 的**备份 / 校验 / 还原 / 迁移**工具。单文件，默认零依赖（Python 3.8+），Windows / macOS / Linux 通用。
 
 ## 为什么还需要它
 
@@ -12,41 +12,45 @@ Hermes Agent 的**备份 / 校验 / 还原 / 迁移**工具。单文件、零依
 | --- | --- | --- |
 | 体积 | 4.9 GB（含 cache / tools / venv） | 66 MB 数据，压完约 19 MB |
 | 凭据 | `auth.json`、平台 token 一起带走 | 默认跳过 8 类凭据路径，配置值脱敏 |
-| 完整性 | 无 | 每文件 sha256，`verify` 可证明未损坏 |
-| 加密 | 无，压缩包即明文 | `--encrypt`，口令错误直接拒绝 |
+| 一致性 | 运行中直接拷 SQLite，可能拷到半截 | SQLite backup API 快照 + integrity_check |
+| 完整性 | 无 | 每文件 sha256，审计重复/缺失/多余条目 |
+| 加密 | 无，压缩包即明文 | v2：AES-256-CTR + HMAC；错口令直接拒绝 |
 | 换机速度 | 要重拉最慢的 clone | `source` profile 保留 `.git`，免 clone |
-| 自动化 | 手动 | 一条命令，可进定时任务 / CI |
-
-它不做的：不重装 Python 环境与网关服务（那仍是官方安装器的事），也不处理 SQLite 的在线一致性（备份前请先退出 Hermes）。
 
 ## 安全模型（默认不含敏感内容）
 
-默认档位做三件事：
-
 1. **排除凭据类路径**：`auth.json`、`gateway-connections.json`、`gateway_state.json`、`channel_directory.json`、`platforms/`、`pairing/`、`bot_relay/`。
-2. **脱敏配置**：`config.yaml`、`*.env` 里形如 `api_key: sk-...`、`token: ...` 的值替换为 `<<REDACTED>>`；布尔值、数字、`${ENV}` 引用保持原样，避免破坏还原后的行为。
-3. **不打包缓存**：`cache/`、`logs/`、`tools/`、`node/`、`runtime/`、`*.venv`、`*.lock`、`*.pid` 全部跳过。
+2. **脱敏配置**：`config.yaml`、`*.env` 里形如 `api_key: sk-...`、`token: ...` 的值替换为 `<<REDACTED>>`；布尔、数字、`${ENV}` 引用保持原样。
+3. **不打包缓存**：`cache/`、`logs/`、`tools/`、`node/`、`runtime/`、`.venv`、`*.lock`、`*.pid`。
 
-## 需要连密钥一起带走时
+## 数据一致性
 
-`--with-secrets` 会包含凭据文件，并且**强制要求加密**：
+- **SQLite**：`state.db`、`kanban.db`、`projects.db`、`cron/executions.db` 先通过 backup API 快照，跑 `PRAGMA integrity_check`，通过后才归档；WAL 内容一并进入快照。需要保留原始文件形态时用 `--no-db-snapshot`。
+- **竞态**：归档是边写边算哈希的单趟流程，manifest 描述的就是压缩包里真实的字节，不存在"算完哈希又被改"的窗口。
+- **路径**：创建、校验、还原三处都做统一校验，拒绝盘符、UNC、反斜杠、`..`/`.`、控制字符、Windows 保留设备名、结尾点/空格。
+
+## 审计规则（`verify` / `restore` 都会跑）
+
+- 重复 ZIP 条目（大小写不敏感）与重复 manifest 路径
+- manifest 记录但包里缺失、包里存在但 manifest 未登记
+- 大小不符、sha256 不符、路径不安全
+- `totals.files` / `totals.bytes` 与条目不一致
+- 读取时由 zipfile 自动校验 CRC
+
+任何一条不过，`verify` 返回非零，`restore` 直接拒绝。
+
+## 加密
+
+`--with-secrets` 会包含凭据文件，并**强制要求加密**：
 
 ```bash
 python hermes_backup.py backup --profile data --with-secrets --encrypt
-# 输出 hermes-backup-data-20261124-1930.hbz
 ```
 
-口令可以用三种方式给：交互输入（两次确认）、`--password-env VAR`、`--password-file FILE`。
-
-加密方案（纯标准库，无第三方依赖）：
-
-- 口令派生：**PBKDF2-HMAC-SHA256**，210000 次迭代，64 字节
-- 加密：HMAC-SHA256 计数器密钥流（CTR 式），XOR 加密
-- 完整性：**encrypt-then-MAC**，对整个密文做 HMAC-SHA256，错误口令在解密时即被拒绝
-
-> 这是一个自定义构造，不是 age/GPG 那种经过长期审计的标准格式。对"防止备份包被随手打开"够用；如果你要对抗更强的对手，请改用 `age` 或 `gpg` 再包一层。
-
-确实要明文带凭据（不推荐）时：`--with-secrets --allow-plaintext-secrets`。
+- **v2（默认）**：PBKDF2-HMAC-SHA256（210,000 次）+ AES-256-CTR + HMAC-SHA256（encrypt-then-MAC）。需要可选依赖 `cryptography`；未安装时会明确提示。
+- **v1**：纯标准库的 HMAC-SHA256 密钥流，适合不能装依赖的环境；v2 的读写都可随时切回 `--crypto v1`。
+- 口令来源：交互输入、`--password-env VAR`、`--password-file FILE`。KDF 迭代次数被限制在 5 万～200 万，口令长度上限 1024。
+- 两种格式的包都能被新版读取；错口令或密文被改动会在解密阶段拒绝。
 
 ## 快速开始
 
@@ -55,17 +59,8 @@ python hermes_backup.py backup --profile data --out D:\backup\hermes.zip
 python hermes_backup.py verify D:\backup\hermes.zip
 python hermes_backup.py list   D:\backup\hermes.zip
 python hermes_backup.py restore D:\backup\hermes.zip --into D:\staging --dry-run
+python hermes_backup.py selftest
 ```
-
-## 命令
-
-| 命令 | 作用 |
-| --- | --- |
-| `backup` | 打包指定 profile |
-| `verify` | 按 manifest 逐文件校验 sha256 |
-| `list` | 不解压查看内容 |
-| `restore` | 解包到目标目录（默认自动识别 Hermes home） |
-| `selftest` | 离线往返测试（含加密、脱敏、错误口令） |
 
 ### profiles
 
@@ -75,21 +70,19 @@ python hermes_backup.py restore D:\backup\hermes.zip --into D:\staging --dry-run
 | `source` | `hermes-agent/`（含 `.git`） | 数百 MB |
 | `full` | 两者 | 两者之和 |
 
-### backup 常用选项
+### backup 选项
 
 | 选项 | 说明 |
 | --- | --- |
 | `--out PATH` | 输出路径；加密时后缀为 `.hbz` |
 | `--with-secrets` | 包含凭据（必须同时 `--encrypt`） |
-| `--encrypt` | 口令加密 |
+| `--encrypt` / `--crypto v1\|v2` | 口令加密与加密格式 |
 | `--password-env VAR` / `--password-file F` | 非交互提供口令 |
-| `--allow-plaintext-secrets` | 允许明文带凭据（危险） |
+| `--no-db-snapshot` | 不做 SQLite 一致性快照 |
 | `--no-scrub` | 关闭配置脱敏 |
 | `--anonymize` | manifest 里隐藏主机名和 home 路径 |
-| `--no-hash` | 跳过 sha256，更快但校验变弱 |
 | `--exclude GLOB` | 额外排除，可重复 |
-| `--dry-run` | 只估算不写文件 |
-| `--force` | 覆盖已存在的输出 |
+| `--dry-run` / `--force` | 只估算 / 覆盖已有输出 |
 
 ### restore
 
@@ -99,33 +92,29 @@ python hermes_backup.py restore hermes.zip --only sessions --force
 python hermes_backup.py restore hermes.hbz --password-env HB_PASS
 ```
 
-还原有路径穿越防护；默认拒绝覆盖已有文件；加密包先校验 MAC 再写盘。
+还原前会先跑完整审计；默认拒绝覆盖已有文件；默认不穿越符号链接/ junction。
 
-## 包结构
+## 兼容性
 
-```
-hermes-backup-data-20261124.zip
-├── manifest.json      # 工具版本、profile、hermes 版本、每文件 sha256、是否含密钥
-├── config.yaml
-├── state.db
-└── sessions/...
-```
-
-## 还原之后
-
-数据只是数据；可执行文件、Python 环境、服务注册要重新安装：
-
-1. 退出 Hermes（含托盘），Windows 上数据库可能被占用；
-2. 还原到 `%LOCALAPPDATA%\hermes`（Windows）或 `~/.hermes`；
-3. 跑官方安装器补齐 venv / tools / 网关服务；
-4. 启动确认会话与配置还在。
+- 归档 manifest 格式 1（0.2.x）与 2（0.3.x）都能读。
+- 加密 v1 与 v2 都能读；写哪个由 `--crypto` 决定。
+- Python 3.8+；`cryptography` 仅在 v2 加密时需要。
 
 ## 已知限制
 
-- 不处理 SQLite WAL 的在线一致性：建议先退出 Hermes 再备份。
 - 脱敏是启发式正则，不是内容审计；自定义插件把密钥藏进别的文件名时不会被发现。
-- 加密是自实现构造（见上），未做侧信道加固。
+- `--no-db-snapshot` 下不保证 SQLite 一致性。
+- 加密没有硬件密钥或密钥托管；口令丢失即无法恢复。
 - `source` profile 依赖完整 `.git`；浅克隆在新机上仍可能需要联网补历史。
+
+## 开发与测试
+
+```bash
+python -m unittest discover -s tests   # 28 项：路径、审计、加密、SQLite、备份/恢复
+python hermes_backup.py selftest
+```
+
+CI 在 Ubuntu 22.04 与 Windows 上跑 Python 3.8–3.13，其中一个任务安装 `cryptography` 以覆盖 v2 路径。
 
 ## 许可
 
