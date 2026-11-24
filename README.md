@@ -1,5 +1,7 @@
 # hermes-backup
 
+[![ci](https://github.com/ZjusUUUXIANGCAI/Hermes-backup-tool/actions/workflows/ci.yml/badge.svg)](https://github.com/ZjusUUUXIANGCAI/Hermes-backup-tool/actions/workflows/ci.yml)
+
 Hermes Agent 的**备份 / 校验 / 还原 / 迁移**工具。单文件、零依赖、只用 Python 标准库（3.8+），Windows / macOS / Linux 通用。
 
 ## 安全模型（默认不含敏感内容）
