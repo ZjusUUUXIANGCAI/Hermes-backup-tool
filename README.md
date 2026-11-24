@@ -17,6 +17,18 @@ Hermes Agent 的**备份 / 校验 / 还原 / 迁移**工具。单文件，默认
 | 加密 | 无，压缩包即明文 | v2：AES-256-CTR + HMAC；错口令直接拒绝 |
 | 换机速度 | 要重拉最慢的 clone | `source` profile 保留 `.git`，免 clone |
 
+## 直接运行（免安装）
+
+| 平台 | 文件 | 用法 |
+| --- | --- | --- |
+| Windows x64 | `hermes-backup-0.3.0-win64.zip` | 解压，运行 `hermes-backup\hermes-backup.exe` |
+| macOS / Linux / WSL | `hermes-backup.sh` + `hermes_backup.py` | 同一目录下 `chmod +x hermes-backup.sh`，然后 `./hermes-backup.sh --help` |
+| 任意平台（源码） | `hermes_backup.py` | `python hermes_backup.py --help` |
+
+Windows 包内置 Python 与 `cryptography`，v1/v2 加密都能直接用；exe 未做代码签名，首次运行 SmartScreen 会提示，选"更多信息 → 仍要运行"。
+
+下载：<https://github.com/ZjusUUUXIANGCAI/Hermes-backup-tool/releases/latest>
+
 ## 安全模型（默认不含敏感内容）
 
 1. **排除凭据类路径**：`auth.json`、`gateway-connections.json`、`gateway_state.json`、`channel_directory.json`、`platforms/`、`pairing/`、`bot_relay/`。
