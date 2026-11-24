@@ -34,7 +34,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 TOOL = "hermes-backup"
-VERSION = "0.3.1"
+VERSION = "0.3.2"
 FORMAT = 2
 MANIFEST = "manifest.json"
 MAGIC1 = b"HBZ1"
@@ -430,6 +430,11 @@ def decrypt_file_v2(src: Path, dst: Path, password: str) -> None:
 
 
 def resolve_password(args, confirm: bool = False) -> str:
+    direct = getattr(args, "password", None)
+    if direct:
+        if len(direct) > MAX_PASSWORD:
+            fail("passphrase too long")
+        return direct
     if getattr(args, "password_env", None):
         value = os.environ.get(args.password_env)
         if not value:
@@ -1014,6 +1019,137 @@ def cmd_selftest(args) -> int:
         shutil.rmtree(str(tmp), ignore_errors=True)
 
 
+
+# --- interactive console ----------------------------------------------------
+
+MENU = """
+============================================================
+  hermes-backup  {version}
+------------------------------------------------------------
+   1) 备份数据（默认，不含密钥，自动跳过缓存与凭据）
+   2) 备份并加密（可包含密钥，需要口令）
+   3) 校验备份包
+   4) 查看备份包内容
+   5) 还原备份
+   6) 自检（离线跑一遍完整流程）
+   0) 退出
+============================================================"""
+
+
+def _ask(prompt: str, default: str = "") -> str:
+    """input() wrapper: EOF (Ctrl+Z / closed stdin) exits the menu."""
+    try:
+        value = input(prompt)
+    except EOFError:
+        raise SystemExit(0)
+    value = value.strip().strip('"').strip("'")
+    return value if value else default
+
+
+def _pause() -> None:
+    try:
+        input("\n按回车返回菜单...")
+    except EOFError:
+        raise SystemExit(0)
+
+
+def _ns(**kw):
+    base = dict(home=None, profile="data", out=None, force=False, with_secrets=False,
+                encrypt=False, crypto="v2", allow_plaintext_secrets=False,
+                no_scrub=False, db_snapshot=True, anonymize=False, exclude=[],
+                dry_run=False, password=None, password_env=None, password_file=None,
+                only=None, into=None, skip_verify=False)
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def _menu_backup(with_secrets: bool) -> None:
+    profile = _ask("profile [data/source/full]（默认 data）: ", "data")
+    if profile not in PROFILES:
+        warn("未知 profile，返回 data")
+        profile = "data"
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    default_out = str(Path.cwd() / ("hermes-backup-%s-%s%s" % (
+        profile, stamp, ".hbz" if with_secrets else ".zip")))
+    out = _ask("输出文件（默认 %s）: " % default_out, default_out)
+    password = None
+    if with_secrets:
+        if not HAVE_AES:
+            warn("未安装 cryptography，将使用 v1（纯标准库）加密")
+        pw1 = getpass.getpass("设置口令: ")
+        pw2 = getpass.getpass("再输一次: ")
+        if pw1 != pw2 or not pw1:
+            fail("两次口令不一致或为空")
+        password = pw1
+    args = _ns(profile=profile, out=out, with_secrets=with_secrets,
+               encrypt=with_secrets, password=password, force=False)
+    cmd_backup(args)
+
+
+def _menu_verify() -> None:
+    archive = _ask("备份包路径: ")
+    if not archive:
+        return
+    cmd_verify(_ns(archive=archive))
+
+
+def _menu_list() -> None:
+    archive = _ask("备份包路径: ")
+    if not archive:
+        return
+    cmd_list(_ns(archive=archive))
+
+
+def _menu_restore() -> None:
+    archive = _ask("备份包路径: ")
+    if not archive:
+        return
+    target = _ask("还原到（默认自动识别 Hermes 数据目录）: ", "")
+    into = target or None
+    log("先做一次预演（不会写文件）...")
+    cmd_restore(_ns(archive=archive, into=into, dry_run=True))
+    if _ask("确认还原？(y/N): ", "n").lower() != "y":
+        log("已取消")
+        return
+    try:
+        cmd_restore(_ns(archive=archive, into=into, force=False))
+    except SystemExit:
+        if _ask("存在冲突文件，覆盖？(y/N): ", "n").lower() == "y":
+            cmd_restore(_ns(archive=archive, into=into, force=True))
+        else:
+            log("已取消")
+
+
+def run_interactive() -> int:
+    handlers = {
+        "1": lambda: _menu_backup(False),
+        "2": lambda: _menu_backup(True),
+        "3": _menu_verify,
+        "4": _menu_list,
+        "5": _menu_restore,
+        "6": lambda: cmd_selftest(_ns()),
+    }
+    log(MENU.format(version=VERSION))
+    while True:
+        choice = _ask("\n请选择 [0-6]: ", "")
+        if choice in ("0", "q", "quit", "exit"):
+            log("再见。")
+            return 0
+        handler = handlers.get(choice)
+        if handler is None:
+            warn("无效选项：%s" % choice)
+            continue
+        try:
+            handler()
+        except SystemExit as exc:
+            if exc.code not in (0, None):
+                warn("操作未完成（退出码 %s）" % exc.code)
+        except KeyboardInterrupt:
+            log("\n已中断。")
+            return 0
+        _pause()
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="hermes-backup",
@@ -1095,8 +1231,9 @@ def main(argv=None) -> int:
             _pause_if_interactive()
         raise
     if not getattr(args, "command", None):
+        if sys.stdin and sys.stdin.isatty():
+            return run_interactive()
         parser.print_help()
-        _pause_if_interactive()
         return 2
     return args.func(args)
 

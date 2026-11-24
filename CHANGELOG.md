@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.3.2 - 2026-11-24
+
+### Added
+- Interactive console: double-clicking the executable now opens a menu
+  (backup / encrypted backup / verify / list / restore / selftest) instead of printing help.
+  Every action stays on screen until Enter is pressed.
+
+### Changed
+- `--version` now reports 0.3.2.
+
 ## 0.3.1 - 2026-11-24
 
 ### Fixed
