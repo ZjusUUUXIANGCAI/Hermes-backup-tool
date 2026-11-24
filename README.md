@@ -21,12 +21,14 @@ Hermes Agent 的**备份 / 校验 / 还原 / 迁移**工具。单文件，默认
 
 | 平台 | 文件 | 用法 |
 | --- | --- | --- |
-| Windows x64（单文件，推荐） | `hermes-backup-0.3.0-win64.exe` | 直接运行，免解压（在 exe 同目录解压临时文件） |
-| Windows x64（目录版） | `hermes-backup-0.3.0-win64.zip` | 解压，运行 `hermes-backup\hermes-backup.exe` |
+| Windows x64（单文件，推荐） | `hermes-backup-0.3.1-win64.exe` | 直接运行，免解压（在 exe 同目录解压临时文件） |
+| Windows x64（目录版） | `hermes-backup-0.3.1-win64.zip` | 解压，运行 `hermes-backup\hermes-backup.exe` |
 | macOS / Linux / WSL | `hermes-backup.sh` + `hermes_backup.py` | 同一目录下 `chmod +x hermes-backup.sh`，然后 `./hermes-backup.sh --help` |
 | 任意平台（源码） | `hermes_backup.py` | `python hermes_backup.py --help` |
 
 Windows 包内置 Python 与 `cryptography`，v1/v2 加密都能直接用；exe 未做代码签名，首次运行 SmartScreen 会提示，选"更多信息 → 仍要运行"。
+
+双击 exe（不带参数）会打印帮助并等待回车，不会一闪而过；脚本里想跳过等待可设 `HERMES_BACKUP_NO_PAUSE=1`。
 
 下载：<https://github.com/ZjusUUUXIANGCAI/Hermes-backup-tool/releases/latest>
 

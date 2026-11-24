@@ -34,7 +34,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 TOOL = "hermes-backup"
-VERSION = "0.3.0"
+VERSION = "0.3.1"
 FORMAT = 2
 MANIFEST = "manifest.json"
 MAGIC1 = b"HBZ1"
@@ -1075,11 +1075,28 @@ def build_parser() -> argparse.ArgumentParser:
     return p
 
 
+def _pause_if_interactive() -> None:
+    """Keep the console open on double-click (no args) instead of flashing."""
+    if os.environ.get("HERMES_BACKUP_NO_PAUSE"):
+        return
+    try:
+        if sys.stdin and sys.stdin.isatty():
+            input("\n按回车键退出...")
+    except (EOFError, OSError):
+        pass
+
+
 def main(argv=None) -> int:
     parser = build_parser()
-    args = parser.parse_args(argv)
+    try:
+        args = parser.parse_args(argv)
+    except SystemExit as exc:
+        if exc.code not in (0, None):
+            _pause_if_interactive()
+        raise
     if not getattr(args, "command", None):
         parser.print_help()
+        _pause_if_interactive()
         return 2
     return args.func(args)
 

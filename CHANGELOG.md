@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.3.1 - 2026-11-24
+
+### Fixed
+- Double-clicking the .exe (no arguments) no longer closes the console instantly:
+  it prints the help text and waits for Enter. Set `HERMES_BACKUP_NO_PAUSE=1` to restore
+  the old behaviour for scripts.
+
+### Builds
+- Windows single-file build now extracts its temporary files next to the executable
+  (`--runtime-tmpdir .`), which also works when `%TEMP%` is restricted.
+
 ## 0.3.0 - 2026-11-24
 
 安全性与可靠性版本。
