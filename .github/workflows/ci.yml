@@ -10,11 +10,11 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, windows-latest]
+        # ubuntu-latest is 26.04, where setup-python has no builds for older
+        # interpreters; 22.04 still ships 3.8 through 3.13.
+        os: [ubuntu-22.04, windows-latest]
         python: ["3.9", "3.11", "3.12", "3.13"]
         include:
-          # Python 3.8 is still claimed by README.md; ubuntu-latest (24.04) no
-          # longer ships it, so pin that one combination to 22.04.
           - os: ubuntu-22.04
             python: "3.8"
     runs-on: ${{ matrix.os }}
