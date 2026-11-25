@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.5 - 2026-11-25
+
+### Fixed
+- Windows console QuickEdit is disabled while the tool runs: a click inside the
+  console window used to switch it into select mode, pausing the program and
+  swallowing all keyboard input until Esc, which made the interactive menu look
+  dead (the window title gained a "Select" prefix). Trade-off: right-button
+  paste is gone with QuickEdit; use Ctrl+V instead.
+
 ## 0.3.4 - 2026-11-25
 
 ### Fixed

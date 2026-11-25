@@ -34,7 +34,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 TOOL = "hermes-backup"
-VERSION = "0.3.4"
+VERSION = "0.3.5"
 FORMAT = 2
 MANIFEST = "manifest.json"
 MAGIC1 = b"HBZ1"
@@ -129,6 +129,28 @@ def bold(text: str) -> str:
 _ASCII_ONLY = False
 
 
+def _disable_quick_edit() -> None:
+    """Turn off Windows console QuickEdit: a click inside the window must not
+    pause the program and swallow keyboard input (the frozen-menu trap)."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        kernel = ctypes.windll.kernel32
+        get_mode = kernel.GetConsoleMode
+        set_mode = kernel.SetConsoleMode
+        get_mode.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        set_mode.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        kernel.GetStdHandle.restype = ctypes.c_void_p
+        handle = kernel.GetStdHandle(-10)  # STD_INPUT_HANDLE
+        mode = ctypes.c_uint()
+        if handle and get_mode(handle, ctypes.byref(mode)):
+            # ENABLE_EXTENDED_FLAGS on, ENABLE_QUICK_EDIT_MODE off
+            set_mode(handle, (mode.value | 0x0080) & ~0x0040)
+    except Exception:
+        pass
+
+
 def _setup_console() -> None:
     """Force UTF-8 console output; fall back to ASCII when that is impossible."""
     global _ASCII_ONLY
@@ -140,6 +162,7 @@ def _setup_console() -> None:
             kernel.SetConsoleCP(65001)
         except Exception:
             pass
+    _disable_quick_edit()
     for name in ("stdout", "stderr"):
         stream = getattr(sys, name, None)
         try:
@@ -1242,6 +1265,7 @@ def _menu_restore() -> None:
 
 
 def run_interactive() -> int:
+    _disable_quick_edit()  # re-apply in case the console mode was reset
     handlers = {
         "1": lambda: _menu_backup(False),
         "2": lambda: _menu_backup(True),

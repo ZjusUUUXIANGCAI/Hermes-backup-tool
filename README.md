@@ -25,8 +25,8 @@ Hermes Agent 的**备份 / 校验 / 还原 / 迁移**工具。单文件，默认
 
 | 平台 | 文件 | 用法 |
 | --- | --- | --- |
-| Windows x64（单文件，推荐） | `hermes-backup-0.3.4-win64.exe` | 直接运行，免解压（在 exe 同目录解压临时文件） |
-| Windows x64（目录版） | `hermes-backup-0.3.4-win64.zip` | 解压，运行 `hermes-backup\hermes-backup.exe` |
+| Windows x64（单文件，推荐） | `hermes-backup-0.3.5-win64.exe` | 直接运行，免解压（在 exe 同目录解压临时文件） |
+| Windows x64（目录版） | `hermes-backup-0.3.5-win64.zip` | 解压，运行 `hermes-backup\hermes-backup.exe` |
 | macOS / Linux / WSL | `hermes-backup.sh` + `hermes_backup.py` | 同一目录下 `chmod +x hermes-backup.sh`，然后 `./hermes-backup.sh --help` |
 | 任意平台（源码） | `hermes_backup.py` | `python hermes_backup.py --help` |
 
