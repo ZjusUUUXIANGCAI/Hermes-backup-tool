@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.3.4 - 2026-11-25
+
+### Fixed
+- UnicodeEncodeError on Windows consoles whose code page is GBK/cp1252: the tool now
+  switches the console to UTF-8 and reconfigures stdout/stderr, and falls back to an
+  ASCII menu and "OK" markers when UTF-8 is unavailable.
+- The packaged .exe no longer crashes at `selftest` on such consoles.
+- Windows CI jobs (unit tests) no longer fail on non-UTF-8 output encoding.
+
 ## 0.3.3 - 2026-11-24
 
 ### Changed

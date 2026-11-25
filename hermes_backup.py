@@ -34,7 +34,7 @@ import zipfile
 from pathlib import Path, PurePosixPath
 
 TOOL = "hermes-backup"
-VERSION = "0.3.3"
+VERSION = "0.3.4"
 FORMAT = 2
 MANIFEST = "manifest.json"
 MAGIC1 = b"HBZ1"
@@ -126,26 +126,62 @@ def bold(text: str) -> str:
     return paint("1", text)
 
 
+_ASCII_ONLY = False
+
+
+def _setup_console() -> None:
+    """Force UTF-8 console output; fall back to ASCII when that is impossible."""
+    global _ASCII_ONLY
+    if os.name == "nt":
+        try:
+            import ctypes
+            kernel = ctypes.windll.kernel32
+            kernel.SetConsoleOutputCP(65001)
+            kernel.SetConsoleCP(65001)
+        except Exception:
+            pass
+    for name in ("stdout", "stderr"):
+        stream = getattr(sys, name, None)
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+    encoding = (getattr(sys.stdout, "encoding", "") or "").lower()
+    _ASCII_ONLY = "utf" not in encoding
+
+
+def _emit(text: str, err: bool = False) -> None:
+    stream = sys.stderr if err else sys.stdout
+    try:
+        print(text, file=stream, flush=True)
+    except UnicodeEncodeError:
+        print(text.encode("ascii", "replace").decode("ascii"), file=stream, flush=True)
+
+
+_setup_console()
+
+
 def log(msg: str) -> None:
     if _QUIET:
         return
-    print(msg, flush=True)
+    _emit(msg)
 
 
 def warn(msg: str) -> None:
     if _QUIET:
         return
-    print(yellow("warning: ") + msg, file=sys.stderr, flush=True)
+    _emit(yellow("warning: ") + msg, err=True)
 
 
 def fail(msg: str, code: int = 1):
     if not _SUPPRESS_FAILS:
-        print(red("error: ") + msg, file=sys.stderr, flush=True)
+        _emit(red("error: ") + msg, err=True)
     raise SystemExit(code)
 
 
 def step(msg: str) -> None:
-    print("  " + green("✓") + " " + msg, flush=True)
+    mark = "OK" if _ASCII_ONLY else "✓"
+    _emit("  " + green(mark) + " " + msg)
 
 
 def human(n: float) -> str:
@@ -1091,6 +1127,18 @@ def cmd_selftest(args) -> int:
 
 def print_menu() -> None:
     line = "=" * 60
+    if _ASCII_ONLY:
+        items = [("1", "backup (no secrets)"), ("2", "backup + encrypt"),
+                 ("3", "verify an archive"), ("4", "list an archive"),
+                 ("5", "restore"), ("6", "selftest"), ("0", "quit")]
+        print()
+        print(line)
+        print("  hermes-backup  " + VERSION)
+        print(line)
+        for num, text in items:
+            print("   " + num + ") " + text)
+        print(line)
+        return
     items = [
         ("1", "备份数据" + cyan("（默认，不含密钥）")),
         ("2", "备份并加密" + cyan("（可包含密钥，需要口令）")),
